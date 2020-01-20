@@ -4,6 +4,13 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+#include <string.h>
+#include <pthread.h>
+#include <sys/types.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <stdint.h>
+
 #include "nccl.h"
 #include "nccl_net.h"
 #include "core.h"
@@ -13,19 +20,13 @@
 #include "sharp/api/version.h"
 #include "sharp/api/sharp_coll.h"
 
-#include <string.h>
-#include <pthread.h>
-#include <sys/types.h>
-#include <sys/time.h>
-#include <unistd.h>
-
 #define MAX_REQUESTS 128
 #define MAXNAMESIZE 64
 #define MAX_IB_DEVS 16
 
 extern ncclNet_t NCCL_PLUGIN_SYMBOL;
 extern struct ncclIbDev ncclIbDevs[MAX_IB_DEVS];
-extern int ncclNSharpDevs;
+int ncclNSharpDevs = -1;
 
 struct ncclSharpRequest {
   void *sharpRequest;
@@ -403,12 +404,8 @@ ncclResult_t ncclSharpInit(ncclDebugLogger_t logFunction) {
   return NCCL_PLUGIN_SYMBOL.init(logFunction);
 }
 
-ncclResult_t ncclSharpPciPath(int dev, char** path) {
-  return NCCL_PLUGIN_SYMBOL.pciPath(dev, path);
-}
-
-ncclResult_t ncclSharpPtrSupport(int dev, int* supportedTypes) {
-  return NCCL_PLUGIN_SYMBOL.ptrSupport(dev, supportedTypes);
+ncclResult_t ncclSharpGetProperties(int dev, ncclNetProperties_t* props) {
+  return NCCL_PLUGIN_SYMBOL.getProperties(dev, props);
 }
 
 ncclResult_t ncclSharpListen(int dev, void* opaqueHandle, void** listenComm) {
@@ -428,8 +425,7 @@ ncclCollNet_t NCCL_COLLNET_PLUGIN_SYMBOL = {
   "SHARP",
   ncclSharpInit,
   ncclSharpDevices,
-  ncclSharpPciPath,
-  ncclSharpPtrSupport,
+  ncclSharpGetProperties,
   ncclSharpListen,
   ncclSharpConnect,
   ncclSharpReduceSupport,

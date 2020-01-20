@@ -7,8 +7,12 @@
 #ifndef NCCL_UTILS_H_
 #define NCCL_UTILS_H_
 
-#include "nccl.h"
 #include <stdint.h>
+#include <pthread.h>
+#include <inttypes.h>
+#include "stdint.h"
+#include "nccl_net.h"
+#include "param.h"
 
 #define NCCL_STATIC_ASSERT(_cond, _msg) \
     switch(0) {case 0:case (_cond):;}
@@ -42,6 +46,7 @@ struct netIf {
   int port;
 };
 
+int devCompare(const void *a, const void *b);
 int parseStringList(const char* string, struct netIf* ifList, int maxList);
 int matchIfList(const char* string, int port, struct netIf* ifList, int listSize);
 int readFileNumber(long *value, const char *filename_fmt, ...);
