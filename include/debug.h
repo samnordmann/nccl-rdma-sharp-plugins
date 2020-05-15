@@ -14,6 +14,7 @@ extern ncclDebugLogger_t pluginLogFunction;
 #define WARN(...) pluginLogFunction(NCCL_LOG_WARN, NCCL_ALL, __FILE__, __LINE__, __VA_ARGS__)
 #define INFO(FLAGS, ...) pluginLogFunction(NCCL_LOG_INFO, (FLAGS), __func__, __LINE__, __VA_ARGS__)
 
+#define ENABLE_TRACE
 #ifdef ENABLE_TRACE
 #define TRACE(FLAGS, ...) pluginLogFunction(NCCL_LOG_TRACE, (FLAGS), __func__, __LINE__, __VA_ARGS__)
 #else

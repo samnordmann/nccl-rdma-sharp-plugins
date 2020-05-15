@@ -63,6 +63,9 @@ static inline int envSocketFamily(void) {
 }
 
 static int filterInterfaces(const char* prefixList, char* names, union socketAddress *addrs, int sock_family, int maxIfNameSize, int maxIfs) {
+#ifdef ENABLE_TRACE
+  char line[1024];
+#endif
   struct netIf userIfs[MAX_IFS];
   int searchNot = prefixList && prefixList[0] == '^';
   if (searchNot) prefixList++;

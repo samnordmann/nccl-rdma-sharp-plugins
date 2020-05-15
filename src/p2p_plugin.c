@@ -20,6 +20,7 @@
 #ifdef HAVE_UCX_PLUGIN
 extern ncclNet_t ucxPlugin;
 extern ncclNet_t ucxRmaPlugin;
+extern ncclNet_t uctRmaPlugin;
 #endif
 
 extern ncclNet_t ibPlugin;
@@ -65,11 +66,13 @@ ncclResult_t pluginInit(ncclDebugLogger_t logFunction)
 
   NCCL_PLUGIN_SYMBOL = ibPlugin;
   const char *p2p_layer = getenv("NCCL_PLUGIN_P2P");
+
   if (p2p_layer != NULL) {
     if (!strcasecmp(p2p_layer, "ib")) p2p_plugin = NCCL_P2P_IB;
 #ifdef HAVE_UCX_PLUGIN
     else if (!strcasecmp(p2p_layer, "ucx")) p2p_plugin = NCCL_P2P_UCX;
     else if (!strcasecmp(p2p_layer, "ucx_rma")) p2p_plugin = NCCL_P2P_UCX_RMA;
+    else if (!strcasecmp(p2p_layer, "uct_rma")) p2p_plugin = NCCL_P2P_UCT_RMA;
 #endif
     else {
       WARN("Invalid value %s for NCCL_PLUGIN_P2P, using default.", p2p_layer);
@@ -86,9 +89,12 @@ ncclResult_t pluginInit(ncclDebugLogger_t logFunction)
     case NCCL_P2P_UCX_RMA:
       NCCL_PLUGIN_SYMBOL = ucxRmaPlugin;
       break;
+    case NCCL_P2P_UCT_RMA:
+      NCCL_PLUGIN_SYMBOL = uctRmaPlugin;
+      break;
 #endif
+  }
   INFO(NCCL_INIT|NCCL_NET, "P2P plugin %s", NCCL_PLUGIN_SYMBOL.name);
-}
 
   return NCCL_PLUGIN_SYMBOL.init(logFunction);
 }

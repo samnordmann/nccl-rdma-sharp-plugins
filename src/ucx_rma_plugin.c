@@ -191,8 +191,8 @@ static ncclResult_t ucx_init_context(ucp_context_h *ctx, int dev)
            ncclIbDevs[dev].port);
   UCXCHECK(ucp_config_read("NCCL", NULL, &config));
   UCXCHECK(ucp_config_modify(config, "NET_DEVICES", ucx_dev_name));
-  UCXCHECK(ucp_config_modify(config, "TLS", "ib"));
-  UCXCHECK(ucp_config_modify(config, "ZCOPY_THRESH", "1"));
+  UCXCHECK(ucp_config_modify(config, "TLS", "rc_v,ud_x"));
+  UCXCHECK(ucp_config_modify(config, "ZCOPY_THRESH", "128"));
 
   memset(&ucp_params, 0, sizeof(ucp_params));
   ucp_params.field_mask   = UCP_PARAM_FIELD_FEATURES;
@@ -549,12 +549,13 @@ ncclResult_t nccl_ucx_rma_deregmr(void* comm, void* mhandle)
 
 
 ncclResult_t ucx_rma_get_request(ucx_rma_request_t* reqs,
-                                 ucx_rma_request_t** req)
+                                 ucx_rma_request_t** req,
+                                 int hint)
 {
   ucx_rma_request_t *r;
   int               i;
 
-  for (i=0; i < MAX_REQUESTS; i++) {
+  for (i=hint; i != ((hint - 1 + MAX_REQUESTS) % MAX_REQUESTS); i++) {
     r = reqs + i;
     if (r->used == 0) {
       r->used = 1;
@@ -666,21 +667,20 @@ ncclResult_t nccl_ucx_rma_isend(void *send_comm, void *data, int size,
     return ncclSuccess;
   }
 
-  NCCLCHECK(ucx_rma_get_request(comm->reqs, &req));
+  NCCLCHECK(ucx_rma_get_request(comm->reqs, &req, comm->fifo_head % MAX_REQUESTS));
   req->size = size;
-//  if (comm->rem_key[slot->rkey_idx] == NULL) {
+  if (comm->rem_key[slot->rkey_idx] == NULL) {
     UCXCHECK(ucp_ep_rkey_unpack(comm->ep, (void*)slot->rkey_buf,
                                 &comm->rem_key[slot->rkey_idx]));
-//  }
+  }
 
   st = ucp_put_nbi(comm->ep, data, size, slot->addr, comm->rem_key[slot->rkey_idx]);
   if (st < 0) {
     WARN("ucx_rma isend put_nbi failed %d", (int)st);
     return ncclInternalError;
   }
-  ucp_rkey_destroy(comm->rem_key[slot->rkey_idx]);
   st_ptr = ucp_put_nb(comm->ep, &req->size, sizeof(int),
-                       slot->addr_request, comm->rkey, send_cb);
+                      slot->addr_request, comm->rkey, send_cb);
   if (UCS_PTR_IS_ERR(st)) {
     WARN("ucx_rma isend pub_nb failed %d", (int)st);
     return ncclInternalError;
@@ -690,9 +690,9 @@ ncclResult_t nccl_ucx_rma_isend(void *send_comm, void *data, int size,
   ucp_worker_progress(comm->worker);
 
   slot->ready = 0;
-  slot->addr  = 0ULL;
-  slot->size  = 0;
-  slot->seq   = 0;
+//  slot->addr  = 0ULL;
+//  slot->size  = 0;
+//  slot->seq   = 0;
   comm->fifo_head++;
 
   req->worker = comm->worker;
@@ -702,7 +702,7 @@ ncclResult_t nccl_ucx_rma_isend(void *send_comm, void *data, int size,
 }
 
 ncclResult_t ucx_rma_post_fifo(ucx_rma_recv_comm_t *comm, ucx_rma_mhandle_t *mh,
-                               uint64_t addr, int size, void *req_addr)
+                               uint64_t addr, int size, uint64_t req_addr)
 {
   ucx_rma_send_fifo_t *local_elem;
   uint64_t            remote_addr;
@@ -713,7 +713,7 @@ ncclResult_t ucx_rma_post_fifo(ucx_rma_recv_comm_t *comm, ucx_rma_mhandle_t *mh,
   local_elem->ready        = 1;
   local_elem->size         = size;
   local_elem->seq          = comm->rem_fifo.tail;
-  local_elem->addr_request = (uint64_t)req_addr;
+  local_elem->addr_request = req_addr;
   local_elem->rkey_idx     = mh->index;
 
   memcpy(local_elem->rkey_buf, mh->rkey_buf, mh->rkey_buf_size);
@@ -747,11 +747,11 @@ ncclResult_t nccl_ucx_rma_irecv(void *recv_comm, void *data, int size,
     return ncclSuccess;
   }
   
-  NCCLCHECK(ucx_rma_get_request(comm->reqs, &req));
+  NCCLCHECK(ucx_rma_get_request(comm->reqs, &req, 0));
 
-  NCCLCHECK(ucx_rma_post_fifo(comm, mh, (uint64_t)data, size, (void*)&req->size));
-  ucp_worker_progress(comm->worker);
   req->size   = -1;
+  NCCLCHECK(ucx_rma_post_fifo(comm, mh, (uint64_t)data, size, (uint64_t)&req->size));
+  ucp_worker_progress(comm->worker);
   req->worker = comm->worker;
   req->type   = UCX_RMA_REQ_TYPE_RECV;
 
@@ -788,6 +788,7 @@ ncclResult_t nccl_ucx_rma_flush(void* recv_comm, void* data, int size,
 ncclResult_t nccl_ucx_rma_test(void *request, int *done, int *size)
 {
   ucx_rma_request_t *req = (ucx_rma_request_t*)request;
+  volatile int *size_ptr = &req->size;
 
   ucp_worker_progress(req->worker);
   switch(req->type) {
@@ -803,7 +804,7 @@ ncclResult_t nccl_ucx_rma_test(void *request, int *done, int *size)
       }
     break;
     case UCX_RMA_REQ_TYPE_RECV:
-      if (req->size != -1) {
+      if (*size_ptr != -1) {
         *done = 1;
         req->used = 0;
         if (size) {

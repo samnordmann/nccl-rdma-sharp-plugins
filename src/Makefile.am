@@ -21,7 +21,8 @@ libnccl_net_la_LIBADD   += $(UCX_LIBADD)
 libnccl_net_la_LDFLAGS  += $(UCX_LDFLAGS) 
 libnccl_net_la_SOURCES  += \
 	ucx_plugin.c \
-	ucx_rma_plugin.c
+	ucx_rma_plugin.c \
+	uct_rma_plugin.c
 endif
 
 if HAVE_SHARP_PLUGIN
