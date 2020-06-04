@@ -39,7 +39,8 @@
 NCCL_PARAM(UCXRMADisable, "UCX_RMA_DISABLE", 0);
 
 extern ncclDebugLogger_t pluginLogFunction;
-
+static char nccl_ucx_rma_tls[32] = "";
+static char nccl_ucx_rma_zcopy_thresh[32] ="";
 static int ncclNIbDevs = -1;
 
 typedef struct ucx_rma_mhandle {
@@ -126,7 +127,7 @@ typedef struct nccl_ucx_rma_ctx {
   int                    id;
   int                    fd;
   int                    ready;
-  ucs_status_ptr_t       ep_ready;
+  ucs_status_ptr_t       check_req;
   ucp_context_h          ctx;
   ucp_worker_h           worker;
   ucx_gpu_flush_t        gpuFlush;
@@ -153,9 +154,11 @@ typedef struct ucx_rma_rem_fifo {
 } ucx_rma_rem_fifo_t;
 
 typedef struct nccl_ucx_rma_recv_comm {
-  nccl_ucx_rma_ctx_t     super;
-  ucp_ep_h               ep;
-  ucx_rma_rem_fifo_t     rem_fifo;
+  nccl_ucx_rma_ctx_t super;
+  ucp_ep_h           ep;
+  ucx_rma_rem_fifo_t rem_fifo;
+  int                rem_am_id;
+  void               *rkey_bufs;
 } nccl_ucx_rma_recv_comm_t;
 
 
@@ -181,9 +184,10 @@ static ncclResult_t nccl_ucx_rma_init_ucp(int dev, ucp_context_h *ctx)
   snprintf(ucx_dev_name, PATH_MAX, "%s:%d", ncclIbDevs[dev].devName,
            ncclIbDevs[dev].port);
   UCXCHECK(ucp_config_read("NCCL", NULL, &config));
+
   UCXCHECK(ucp_config_modify(config, "NET_DEVICES", ucx_dev_name));
-  UCXCHECK(ucp_config_modify(config, "TLS", "ib"));
-  UCXCHECK(ucp_config_modify(config, "ZCOPY_THRESH", "128"));
+  UCXCHECK(ucp_config_modify(config, "TLS", nccl_ucx_rma_tls));
+  UCXCHECK(ucp_config_modify(config, "ZCOPY_THRESH", nccl_ucx_rma_zcopy_thresh));
 
   memset(&ucp_params, 0, sizeof(ucp_params));
   ucp_params.field_mask   = UCP_PARAM_FIELD_FEATURES |
@@ -281,6 +285,7 @@ static ncclResult_t nccl_ucx_free_worker(ucp_worker_h worker)
         }
         ucp_worker_destroy(workers[i].worker);
         ucp_cleanup(workers[i].ctx);
+        INFO(NCCL_NET, "worker destroy");
         workers[i].eps    = NULL;
         workers[i].worker = NULL;
         workers[i].ctx    = NULL;
@@ -319,10 +324,33 @@ static ncclResult_t nccl_ucx_add_ep(ucp_worker_h worker, int fd)
 
 ncclResult_t nccl_ucx_rma_init(ncclDebugLogger_t logFunction)
 {
+  char *config_env;
   if (ncclParamUCXRMADisable()) return ncclInternalError;
+  NCCLCHECK(nccl_p2p_ib_init(&ncclNIbDevs, ncclIbDevs, if_name, &nccl_ucx_if_addr,
+                          NULL, logFunction));
 
-  return nccl_p2p_ib_init(&ncclNIbDevs, ncclIbDevs, if_name, &nccl_ucx_if_addr,
-                          NULL, logFunction);
+  if (strlen(nccl_ucx_rma_tls) == 0) {
+    config_env = getenv("NCCL_UCX_TLS");
+    if (config_env != NULL) {
+      snprintf(nccl_ucx_rma_tls, 32, "%s", config_env);
+    } else {
+      snprintf(nccl_ucx_rma_tls, 32, "%s", "rc_v,ud_v");
+    }
+    INFO(NCCL_NET, "NET/UCX_RMA: using transports: %s", nccl_ucx_rma_tls);
+  }
+
+  if (strlen(nccl_ucx_rma_zcopy_thresh) == 0) {
+    config_env = getenv("NCCL_UCX_ZCOPY_THRESH");
+    if (config_env != NULL) {
+      snprintf(nccl_ucx_rma_zcopy_thresh, 32, "%s", config_env);
+    } else {
+      snprintf(nccl_ucx_rma_zcopy_thresh, 32, "%s", "16");
+    }
+    INFO(NCCL_NET, "NET/UCX_RMA: zero copy threshold: %s", nccl_ucx_rma_zcopy_thresh);
+  }
+
+
+  return ncclSuccess;
 }
 
 ncclResult_t nccl_ucx_rma_listen(int dev, void *handle, void **listen_comm)
@@ -343,19 +371,41 @@ ncclResult_t nccl_ucx_rma_listen(int dev, void *handle, void **listen_comm)
   return ncclSuccess;
 }
 
+static ucs_status_t nccl_ucx_rma_am_rkey_cb(void *arg, void *data, size_t length,
+                                            ucp_ep_h reply_ep, unsigned flags)
+{
+  nccl_ucx_rma_send_comm_t *comm = (nccl_ucx_rma_send_comm_t*)arg;
+  char   *rkey_bufs = (char*)data;
+  size_t rkey_buf_size, rkey_buf_num;
+  int    i;
+
+  memcpy(&rkey_buf_num, rkey_bufs, sizeof(size_t));
+  memcpy(&rkey_buf_size, rkey_bufs + sizeof(size_t), sizeof(size_t));
+  rkey_bufs = rkey_bufs + 2 * sizeof(size_t);
+  for (i = 0; i < rkey_buf_num; i++) {
+    UCXCHECK(ucp_ep_rkey_unpack(comm->ep, rkey_bufs, &comm->rem_key[i]));
+    rkey_bufs += rkey_buf_size;
+  }
+
+  return UCS_OK;
+}
+
 ncclResult_t nccl_ucx_rma_connect(int dev, void *handle, void **send_comm)
 {
-  ucx_rma_listen_handle_t *recv_handle = (ucx_rma_listen_handle_t*)handle;
-  nccl_ucx_rma_send_comm_t      *comm;
-  ucp_mem_map_params_t    mmap_params;
-  size_t                  rkey_buf_size;
-  void                    *rkey_buf;
-  uint64_t                fifo_adr;
+  ucx_rma_listen_handle_t  *recv_handle = (ucx_rma_listen_handle_t*)handle;
+  nccl_ucx_rma_send_comm_t *comm;
+  ucp_mem_map_params_t     mmap_params;
+  size_t                   rkey_buf_size;
+  void                     *rkey_buf;
+  uint64_t                 fifo_adr;
 
   NCCLCHECK(ncclIbMalloc((void**)&comm, sizeof(*comm)));
   NCCLCHECK(connectAddress(&comm->super.fd, &recv_handle->connectAddr));
   NCCLCHECK(nccl_ucx_rma_init_comm_context(dev, &comm->super));
   NCCLCHECK(nccl_ucx_rma_send_worker_address(comm->super.worker, comm->super.fd));
+  NCCLCHECK(nccl_ucx_add_ep(comm->super.worker, comm->super.fd));
+  UCXCHECK(ucp_worker_set_am_handler(comm->super.worker, comm->super.id,
+                                     nccl_ucx_rma_am_rkey_cb, comm ,0));
 
   fifo_adr = (uint64_t)comm->fifo;
   mmap_params.field_mask = UCP_MEM_MAP_PARAM_FIELD_ADDRESS |
@@ -368,6 +418,7 @@ ncclResult_t nccl_ucx_rma_connect(int dev, void *handle, void **send_comm)
   NCCLCHECK(socketSend(comm->super.fd, &rkey_buf_size, sizeof(size_t)));
   NCCLCHECK(socketSend(comm->super.fd, rkey_buf, rkey_buf_size));
   NCCLCHECK(socketSend(comm->super.fd, &fifo_adr, sizeof(uint64_t)));
+  NCCLCHECK(socketSend(comm->super.fd, &comm->super.id, sizeof(comm->super.id)));
   ucp_rkey_buffer_release(rkey_buf);
   *send_comm = comm;
 
@@ -388,13 +439,25 @@ static ucs_status_t nccl_ucx_rma_am_cb(void *arg, void *data, size_t length,
   return UCS_OK;
 }
 
-static ncclResult_t nccl_ucx_rma_init_ep(int fd, ucp_worker_h worker, ucp_ep_h *ep)
+static ncclResult_t nccl_ucx_rma_init_ep(int fd, ucp_worker_h worker, ucp_ep_h *ep, int blocking)
 {
+  int bytes = 0;
   ucp_ep_params_t ep_params;
   size_t          peer_addr_len;
   void            *peer_addr;
 
-  NCCLCHECK(socketReceive(fd, &peer_addr_len, sizeof(size_t)));
+  if (blocking) {
+    NCCLCHECK(socketReceive(fd, &peer_addr_len, sizeof(size_t)));
+  } else {
+    NCCLCHECK(socketProgress(NCCL_SOCKET_RECV, fd, &peer_addr_len,
+                            sizeof(size_t), &bytes));
+    if (bytes == 0) {
+      ep = NULL;
+      return ncclSuccess;
+    }
+    NCCLCHECK(socketWait(NCCL_SOCKET_RECV, fd, &peer_addr_len,
+                         sizeof(size_t), &bytes));
+  }
   peer_addr = alloca(peer_addr_len);
   NCCLCHECK(socketReceive(fd, peer_addr, peer_addr_len));
 
@@ -421,9 +484,8 @@ ncclResult_t nccl_ucx_rma_accept(void *listen_comm, void **recv_comm)
   UCXCHECK(ucp_worker_set_am_handler(comm->super.worker, comm->super.id,
                                      nccl_ucx_rma_am_cb, comm->super.reqs,0));
 
-  NCCLCHECK(nccl_ucx_rma_init_ep(comm->super.fd, comm->super.worker, &comm->ep));
-  NCCLCHECK(nccl_ucx_rma_send_worker_address(comm->super.worker, comm->super.fd));
-  NCCLCHECK(socketSend(comm->super.fd, &comm->super.id, sizeof(int)));
+  NCCLCHECK(nccl_ucx_rma_init_ep(comm->super.fd, comm->super.worker, &comm->ep, 1));
+  NCCLCHECK(nccl_ucx_add_ep(comm->super.worker, comm->super.fd));
   NCCLCHECK(socketReceive(comm->super.fd, &rkey_buf_size, sizeof(size_t)));
 
   rkey_buf = malloc(rkey_buf_size);
@@ -432,6 +494,7 @@ ncclResult_t nccl_ucx_rma_accept(void *listen_comm, void **recv_comm)
   }
   NCCLCHECK(socketReceive(comm->super.fd, rkey_buf, rkey_buf_size));
   NCCLCHECK(socketReceive(comm->super.fd, &comm->rem_fifo.addr, sizeof(uint64_t)));
+  NCCLCHECK(socketReceive(comm->super.fd, &comm->rem_am_id, sizeof(int)));
   UCXCHECK(ucp_ep_rkey_unpack(comm->ep, rkey_buf, &comm->rem_fifo.rkey));
   free(rkey_buf);
 
@@ -545,65 +608,154 @@ static void nccl_ucx_rma_flush_cb(void *request, ucs_status_t status)
 }
 
 enum {
-  NCCL_UCX_RMA_COMM_NOT_READY = 0,
-  NCCL_UCX_RMA_EP_CREATED     = 1,
-  NCCL_UCX_RMA_EP_FLUSHED     = 2,
-  NCCL_UCX_RMA_EP_READY       = 3 
+  NCCL_UCX_RMA_SCOMM_NOT_READY = 0,
+  NCCL_UCX_RMA_SCOMM_EP_CREATED,
+  NCCL_UCX_RMA_SCOMM_EP_FLUSHED,
+  NCCL_UCX_RMA_SCOMM_WAIT_RKEY,
+  NCCL_UCX_RMA_SCOMM_READY 
 };
 
 static ncclResult_t nccl_ucx_rma_send_check(nccl_ucx_rma_send_comm_t *comm)
 {
   ucs_status_t st;
 
-  if (comm->super.ready == NCCL_UCX_RMA_COMM_NOT_READY) {
-    NCCLCHECK(nccl_ucx_rma_init_ep(comm->super.fd, comm->super.worker, &comm->ep));
-    NCCLCHECK(nccl_ucx_add_ep(comm->super.worker, comm->super.fd));
+  ucp_worker_progress(comm->super.worker);
+  if (comm->super.ready == NCCL_UCX_RMA_SCOMM_NOT_READY) {
+    NCCLCHECK(nccl_ucx_rma_init_ep(comm->super.fd, comm->super.worker, &comm->ep, 0));
+    if (comm->ep == NULL) {
+      return ncclSuccess;
+    }
     NCCLCHECK(socketReceive(comm->super.fd, &comm->rem_am_id, sizeof(int)));
-    comm->super.ready = NCCL_UCX_RMA_EP_CREATED;
+    comm->super.ready = NCCL_UCX_RMA_SCOMM_EP_CREATED;
+    NCCLCHECK(socketSend(comm->super.fd, &comm->super.ready, sizeof(int)));
   }
 
-  if (comm->super.ready == NCCL_UCX_RMA_EP_CREATED) {
-    comm->super.ep_ready = ucp_ep_flush_nb(comm->ep, 0, nccl_ucx_rma_flush_cb);
+  if (comm->super.ready == NCCL_UCX_RMA_SCOMM_EP_CREATED) {
+    comm->super.check_req = ucp_ep_flush_nb(comm->ep, 0, nccl_ucx_rma_flush_cb);
 
-    if (comm->super.ep_ready == NULL) {
-      comm->super.ready = NCCL_UCX_RMA_EP_READY; 
-    } else if (UCS_PTR_IS_ERR(comm->super.ep_ready)) {
+    if (comm->super.check_req == NULL) {
+      comm->super.ready = NCCL_UCX_RMA_SCOMM_WAIT_RKEY; 
+    } else if (UCS_PTR_IS_ERR(comm->super.check_req)) {
       return ncclSystemError;
     } else {
-      comm->super.ready = NCCL_UCX_RMA_EP_FLUSHED;
+      comm->super.ready = NCCL_UCX_RMA_SCOMM_EP_FLUSHED;
     }
   }
 
-  if (comm->super.ready == NCCL_UCX_RMA_EP_FLUSHED) {
-    ucp_worker_progress(comm->super.worker);
-    st = ucp_request_check_status(comm->super.ep_ready);
+  if (comm->super.ready == NCCL_UCX_RMA_SCOMM_EP_FLUSHED) {
+    st = ucp_request_check_status(comm->super.check_req);
     if (st != UCS_INPROGRESS) {
-      ucp_request_free(comm->super.ep_ready);
-      comm->super.ready = NCCL_UCX_RMA_EP_READY; 
+      ucp_request_free(comm->super.check_req);
+      comm->super.ready = NCCL_UCX_RMA_SCOMM_WAIT_RKEY; 
     }
   }
 
-  if (comm->super.ready == NCCL_UCX_RMA_EP_READY) {
+  if ((comm->super.ready == NCCL_UCX_RMA_SCOMM_WAIT_RKEY) &&
+      (comm->rem_key[0] != NULL)) {
+      comm->super.ready = NCCL_UCX_RMA_SCOMM_READY;
       NCCLCHECK(socketSend(comm->super.fd, &comm->super.ready, sizeof(int)));
   }
 
   return ncclSuccess;
 }
 
+enum {
+  NCCL_UCX_RMA_RCOMM_SEND_CONN_INFO = 0,
+  NCCL_UCX_RMA_RCOMM_WAIT_SENDER,
+  NCCL_UCX_RMA_RCOMM_AM_SEND,
+  NCCL_UCX_RMA_RCOMM_WAIT_AM,
+  NCCL_UCX_RMA_RCOMM_WAIT_SCOMM,
+  NCCL_UCX_RMA_RCOMM_READY,
+};
+
+static void nccl_ucx_rma_recv_check_cb(void *request, ucs_status_t status)
+{
+  return;
+}
+
+
 static ncclResult_t nccl_ucx_rma_recv_check(nccl_ucx_rma_recv_comm_t *comm)
 {
   int bytes = 0;
+  int i, size;
+  int rem_comm_state;
+  char *rkey_bufs_start; 
+  ucs_status_t st;
 
   ucp_worker_progress(comm->super.worker);
-  NCCLCHECK(socketProgress(NCCL_SOCKET_RECV, comm->super.fd, &comm->super.ready,
-                           sizeof(int), &bytes));
-  if (bytes == 0) {
-    return ncclSuccess;
+
+  if (comm->super.ready == NCCL_UCX_RMA_RCOMM_SEND_CONN_INFO) {
+    NCCLCHECK(nccl_ucx_rma_send_worker_address(comm->super.worker, comm->super.fd));
+    NCCLCHECK(socketSend(comm->super.fd, &comm->super.id, sizeof(int)));
+    comm->super.ready = NCCL_UCX_RMA_RCOMM_WAIT_SENDER;
   }
 
-  NCCLCHECK(socketWait(NCCL_SOCKET_RECV, comm->super.fd, &comm->super.ready,
-                       sizeof(int), &bytes));
-  NCCLCHECK(nccl_ucx_add_ep(comm->super.worker, comm->super.fd));
+  if (comm->super.ready == NCCL_UCX_RMA_RCOMM_WAIT_SENDER) {    
+    NCCLCHECK(socketProgress(NCCL_SOCKET_RECV, comm->super.fd, &rem_comm_state,
+                            sizeof(int), &bytes));
+    if (bytes == 0) {
+      return ncclSuccess;
+    }
+
+    NCCLCHECK(socketWait(NCCL_SOCKET_RECV, comm->super.fd, &rem_comm_state,
+                        sizeof(int), &bytes));
+    bytes = 0;
+    if (rem_comm_state == NCCL_UCX_RMA_SCOMM_EP_CREATED) {
+      comm->super.ready = NCCL_UCX_RMA_RCOMM_AM_SEND;
+    } else {
+      WARN("Unexpected socket msg %d (%d)", rem_comm_state, NCCL_UCX_RMA_SCOMM_EP_CREATED);
+      return ncclSystemError;
+    }
+  }
+
+  if (comm->super.ready == NCCL_UCX_RMA_RCOMM_AM_SEND) {
+    size = 2 * sizeof(size_t) + comm->super.num_mh * comm->super.mh[0]->rkey_buf_size;
+    comm->rkey_bufs = malloc(size);
+    memcpy(comm->rkey_bufs, &comm->super.num_mh, sizeof(size_t));
+    memcpy(comm->rkey_bufs + sizeof(size_t), &comm->super.mh[0]->rkey_buf_size, sizeof(size_t));
+    rkey_bufs_start = comm->rkey_bufs + 2 * sizeof(size_t);
+    for (i = 0; i < comm->super.num_mh; i++) {
+      memcpy(rkey_bufs_start, comm->super.mh[i]->rkey_buf, comm->super.mh[i]->rkey_buf_size);
+      rkey_bufs_start += comm->super.mh[i]->rkey_buf_size;
+    }
+    comm->super.check_req = ucp_am_send_nb(comm->ep, comm->rem_am_id, comm->rkey_bufs,
+                                           size, ucp_dt_make_contig(1),
+                                           nccl_ucx_rma_recv_check_cb, 0);
+    ucp_worker_fence(comm->super.worker);
+    if (comm->super.check_req == NULL) {
+      comm->super.ready = NCCL_UCX_RMA_RCOMM_WAIT_SCOMM;
+    } else if (UCS_PTR_IS_ERR(comm->super.check_req)) {
+      return ncclSystemError;
+    } else {
+      comm->super.ready = NCCL_UCX_RMA_RCOMM_WAIT_AM;
+    }
+  }
+
+  if (comm->super.ready == NCCL_UCX_RMA_RCOMM_WAIT_AM) {
+    st = ucp_request_check_status(comm->super.check_req);
+    if (st != UCS_INPROGRESS) {
+      ucp_request_free(comm->super.check_req);
+      free(comm->rkey_bufs);
+      comm->super.ready = NCCL_UCX_RMA_RCOMM_WAIT_SCOMM;
+    }
+  }
+
+  if (comm->super.ready == NCCL_UCX_RMA_RCOMM_WAIT_SCOMM) {
+    NCCLCHECK(socketProgress(NCCL_SOCKET_RECV, comm->super.fd, &rem_comm_state,
+                            sizeof(int), &bytes));
+    if (bytes == 0) {
+      return ncclSuccess;
+    }
+
+    NCCLCHECK(socketWait(NCCL_SOCKET_RECV, comm->super.fd, &rem_comm_state,
+                        sizeof(int), &bytes));
+    if (rem_comm_state == NCCL_UCX_RMA_SCOMM_READY) {
+      comm->super.ready = NCCL_UCX_RMA_RCOMM_READY;
+    } else {
+      WARN("Unexpected socket msg %d (%d)", rem_comm_state, NCCL_UCX_RMA_SCOMM_READY);
+      return ncclSystemError;
+    }    
+  }
 
   return ncclSuccess;
 }
@@ -635,10 +787,10 @@ ncclResult_t nccl_ucx_rma_isend(void *send_comm, void *data, int size,
   int                          req_id;
   ucp_request_param_t          req_param;
 
-  if (comm->super.ready != NCCL_UCX_RMA_EP_READY) {
+  if (comm->super.ready != NCCL_UCX_RMA_SCOMM_READY) {
     NCCLCHECK(nccl_ucx_rma_send_check(comm));
   }
-  if (comm->super.ready != NCCL_UCX_RMA_EP_READY) {
+  if (comm->super.ready != NCCL_UCX_RMA_SCOMM_READY) {
     *request = NULL;
     return ncclSuccess;
   }
@@ -654,10 +806,6 @@ ncclResult_t nccl_ucx_rma_isend(void *send_comm, void *data, int size,
   NCCLCHECK(ucx_rma_get_request(comm->super.reqs, &req_id));
   req = &(comm->super.reqs[req_id]);
   req->size = size;
-//  if (comm->rem_key[slot->rkey_idx] == NULL) {
-    UCXCHECK(ucp_ep_rkey_unpack(comm->ep, (void*)slot->rkey_buf,
-                                &comm->rem_key[slot->rkey_idx]));
-//  }
 
   req_param.op_attr_mask = UCP_OP_ATTR_FIELD_CALLBACK |
                            UCP_OP_ATTR_FIELD_REQUEST  |
@@ -691,9 +839,6 @@ ncclResult_t nccl_ucx_rma_isend(void *send_comm, void *data, int size,
     WARN("NET/UCX_RMA: isend pub_nb failed");
   }
 
-  ucp_rkey_destroy(comm->rem_key[slot->rkey_idx]);
-  comm->rem_key[slot->rkey_idx] = NULL;
-
   req->seq = slot->seq;
   slot->ready = 0;
   slot->addr  = 0ULL;
@@ -723,7 +868,6 @@ ncclResult_t nccl_ucx_rma_post_fifo(nccl_ucx_rma_recv_comm_t *comm,
   local_elem->rkey_idx = mh->index;
   local_elem->req_id   = req_id;
 
-  memcpy(local_elem->rkey_buf, mh->rkey_buf, mh->rkey_buf_size);
   remote_addr = comm->rem_fifo.addr + (comm->rem_fifo.tail % MAX_REQUESTS) *
                                       sizeof(ucx_rma_send_fifo_t);
   st = ucp_put_nbi(comm->ep, (void*)local_elem, sizeof(ucx_rma_send_fifo_t),
@@ -746,11 +890,11 @@ ncclResult_t nccl_ucx_rma_irecv(void *recv_comm, void *data, int size,
   nccl_ucx_rma_request_t   *req;
   int                      req_id;
 
-  if (comm->super.ready != NCCL_UCX_RMA_EP_READY) {
+  if (comm->super.ready != NCCL_UCX_RMA_RCOMM_READY) {
     NCCLCHECK(nccl_ucx_rma_recv_check(comm));
   }
 
-  if (comm->super.ready != NCCL_UCX_RMA_EP_READY) {
+  if (comm->super.ready != NCCL_UCX_RMA_RCOMM_READY) {
     *request = NULL;
     return ncclSuccess;
   }
@@ -837,6 +981,7 @@ ncclResult_t nccl_ucx_rma_close_send(void *send_comm)
 {
   nccl_ucx_rma_send_comm_t *comm = (nccl_ucx_rma_send_comm_t*) send_comm;
   void *close_req;
+  int close = 1;
   int  i;
 
   if (send_comm) {
@@ -850,9 +995,8 @@ ncclResult_t nccl_ucx_rma_close_send(void *send_comm)
     if (comm->ep) {
       close_req = ucp_ep_close_nb(comm->ep, UCP_EP_CLOSE_MODE_FLUSH);
       wait_close(comm->super.worker, close_req);
-      int close = 1;
-      NCCLCHECK(socketSend(comm->super.fd, &close, sizeof(int)));
     }
+    NCCLCHECK(socketSend(comm->super.fd, &close, sizeof(int)));
     nccl_ucx_free_worker(comm->super.worker);
     free(comm);
   }
@@ -864,6 +1008,8 @@ ncclResult_t nccl_ucx_rma_close_recv(void *recv_comm)
 {
   nccl_ucx_rma_recv_comm_t *comm = (nccl_ucx_rma_recv_comm_t*)recv_comm;
   void *close_req;
+  int debug = 1;
+  int close=1;
 
   if (recv_comm) {
     ucp_rkey_destroy(comm->rem_fifo.rkey);
@@ -874,9 +1020,8 @@ ncclResult_t nccl_ucx_rma_close_recv(void *recv_comm)
     if (comm->ep) {
       close_req = ucp_ep_close_nb(comm->ep, UCP_EP_CLOSE_MODE_FLUSH);
       wait_close(comm->super.worker, close_req);
-      int close=1;
-      NCCLCHECK(socketSend(comm->super.fd, &close, sizeof(int)));  
     }
+    NCCLCHECK(socketSend(comm->super.fd, &close, sizeof(int)));  
     nccl_ucx_free_worker(comm->super.worker);
     free(comm);
   }

@@ -87,19 +87,15 @@ ncclResult_t nccl_uct_init(ncclDebugLogger_t logFunction)
                           NULL, logFunction);
 }
 
-enum {
-  NCCL_UCT_REQ_TYPE_SEND,
-  NCCL_UCT_REQ_TYPE_RECV,
-};
-
 typedef struct nccl_uct_request {
   uct_completion_t compl;
   int              used;
-  int              type;
   int              done;
+  int              seq;
   int              size;
-  int              free;
   uct_worker_h     worker;
+  ucs_time_t       start;
+  int              type;
 } nccl_uct_request_t;
 
 typedef struct nccl_uct_ctx {
@@ -119,12 +115,12 @@ typedef struct nccl_uct_ctx {
 
 typedef struct nccl_uct_send_fifo {
   uint64_t addr;
-  uint64_t addr_request;
   int      size;
   uint32_t seq;
   uint32_t ready;
   int      rkey_id;
-  char     rkey_buf[32];
+  uct_rkey_t rkey;
+  //char     rkey_buf[32];
 } nccl_uct_send_fifo_t;
 
 typedef struct nccl_uct_rem_fifo {
@@ -421,6 +417,21 @@ ncclResult_t nccl_uct_connect(int dev, void *handle, void **send_comm)
   return ncclSuccess;
 }
 
+static ucs_status_t nccl_uct_am_cb(void *arg, void *data, size_t length,
+                                   unsigned flags)
+{
+  nccl_uct_request_t *reqs = (nccl_uct_request_t*)arg;
+  uint64_t *header = data;
+  int size = *header & 0xFFFFFFFFFFFFFFFF;
+  int id   = *header >>32 ;
+
+  reqs[id % MAX_REQUESTS].size = size;
+  reqs[id % MAX_REQUESTS].done = 1;
+
+  return UCS_OK;
+}
+
+
 ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm)
 {
   nccl_uct_listen_comm_t *l_comm        = (nccl_uct_listen_comm_t*)listen_comm;
@@ -461,7 +472,7 @@ ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm)
                           UCT_MD_MEM_ACCESS_RMA, &comm->req_memh));
   UCXCHECK(uct_md_mkey_pack(comm->super.md, comm->req_memh, rkey_buf));
   NCCLCHECK(socketSend(comm->super.fd, rkey_buf, rkey_buf_len));
-
+  UCXCHECK(uct_iface_set_am_handler(comm->super.iface, 0, nccl_uct_am_cb, comm->super.reqs, 0));
   *recv_comm = comm;
   return ncclSuccess;
 }
@@ -469,8 +480,10 @@ ncclResult_t nccl_uct_accept(void *listen_comm, void **recv_comm)
 typedef struct nccl_uct_mhandle {
   uct_mem_h uct_mh;
   void      *rkey_buf;
+  uct_rkey_bundle_t rkey_bundle;
   int       rkey_buf_size;
   int       id;
+  int       cached;
 } nccl_uct_mhandle_t;
 
 #define REG_ALIGN (4096)
@@ -495,8 +508,10 @@ ncclResult_t nccl_uct_regmr(void* comm, void* data, int size, int type,
   UCXCHECK(uct_md_mem_reg(ctx->md, (void*)reg_addr, reg_size,
                           UCT_MD_MEM_ACCESS_RMA, &mh->uct_mh));
   UCXCHECK(uct_md_mkey_pack(ctx->md, mh->uct_mh, mh->rkey_buf));
+  UCXCHECK(uct_rkey_unpack(ctx->component, mh->rkey_buf, &mh->rkey_bundle));
+
   mh->rkey_buf_size = ctx->md_attr.rkey_packed_size;
-  
+  mh->cached = 0;
   *mhandle = mh;
   return ncclSuccess;
 }
@@ -506,6 +521,7 @@ ncclResult_t nccl_uct_deregmr(void* comm, void* mhandle)
   nccl_uct_ctx_t     *ctx = (nccl_uct_ctx_t*)comm;
   nccl_uct_mhandle_t *mh  = (nccl_uct_mhandle_t*)mhandle;
 
+  UCXCHECK(uct_rkey_release(ctx->component, &mh->rkey_bundle));
   UCXCHECK(uct_md_mem_dereg(ctx->md, mh->uct_mh));
   free(mh->rkey_buf);
   free(mh);
@@ -560,7 +576,8 @@ void nccl_uct_completion_callback(uct_completion_t *self, ucs_status_t status)
 }
 
 ncclResult_t nccl_uct_get_request(nccl_uct_request_t* reqs,
-                                  nccl_uct_request_t** req)
+                                  nccl_uct_request_t** req,
+                                  int *req_id)
 {
   nccl_uct_request_t *r;
   int                i;
@@ -569,13 +586,12 @@ ncclResult_t nccl_uct_get_request(nccl_uct_request_t* reqs,
     r = reqs + i;
     if (r->used == 0) {
       r->used        = 1;
-      r->type        = 0;
       r->done        = 0;
       r->size        = -1;
-      r->free        = 0;
       r->compl.count = 1;
       r->compl.func  = nccl_uct_completion_callback;
       *req = r;
+      *req_id = i;
       return ncclSuccess;
     }
   }
@@ -596,6 +612,7 @@ ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
   ucs_status_t                  status;
   uct_iov_t                     iov;
   uct_rkey_bundle_t             rkey;
+  int                           req_id;
 
   if (comm->super.ready == 0) {
     NCCLCHECK(nccl_uct_send_check(comm));
@@ -612,39 +629,45 @@ ncclResult_t nccl_uct_isend(void *send_comm, void *data, int size,
     return ncclSuccess;
   }
 
-  NCCLCHECK(nccl_uct_get_request(comm->super.reqs, &req));
-  req->size = 0;
-  if (comm->rkey_cache[slot->rkey_id].exist == 0) {
-    UCXCHECK(uct_rkey_unpack(comm->super.component, (void*)slot->rkey_buf,
-                             &comm->rkey_cache[slot->rkey_id].rkey));
-    comm->rkey_cache[slot->rkey_id].exist = 1;
-  }
+  NCCLCHECK(nccl_uct_get_request(comm->super.reqs, &req, &req_id));
+  // if (comm->rkey_cache[slot->rkey_id].exist == 0) {
+  //   UCXCHECK(uct_rkey_unpack(comm->super.component, (void*)slot->rkey_buf,
+  //                            &comm->rkey_cache[slot->rkey_id].rkey));
+  //   comm->rkey_cache[slot->rkey_id].exist = 1;
+  // }
 
   iov.buffer = data;
   iov.length = size;
   iov.memh   = mh->uct_mh;
   iov.stride = 0;
   iov.count  = 1;
+  // status = uct_ep_put_zcopy(comm->super.ep, &iov, 1, slot->addr,
+  //                           comm->rkey_cache[slot->rkey_id].rkey.rkey,
+  //                           &req->compl);
+  
+  req->type = 0;
+  
   status = uct_ep_put_zcopy(comm->super.ep, &iov, 1, slot->addr,
-                            comm->rkey_cache[slot->rkey_id].rkey.rkey,
+                            slot->rkey,
                             &req->compl);
+
   if (status != UCS_INPROGRESS) {
       req->done = 1;
   }
-  status = uct_ep_put_short(comm->super.ep, &req->size, sizeof(int),
-                            slot->addr_request, comm->rem_req_rkey.rkey);
+  status = uct_ep_am_short(comm->super.ep, 0,
+                           ((uint64_t)slot->seq << 32 | ((uint64_t)size)), NULL, 0);
   slot->ready = 0;
   comm->fifo_head++;
 
   req->worker = comm->super.worker;
-  req->type   = NCCL_UCT_REQ_TYPE_SEND;
+  //uct_worker_progress(req->worker);
   *request = req;
   return ncclSuccess;
 }
 
 
 ncclResult_t nccl_uct_post_fifo(nccl_uct_recv_comm_t *comm, nccl_uct_mhandle_t *mh,
-                                uint64_t addr, int size, uint64_t req_addr)
+                                uint64_t addr, int req_id)
 {
   nccl_uct_send_fifo_t *local_elem;
   uint64_t             remote_addr;
@@ -653,20 +676,17 @@ ncclResult_t nccl_uct_post_fifo(nccl_uct_recv_comm_t *comm, nccl_uct_mhandle_t *
   local_elem = comm->rem_fifo.elems + (comm->rem_fifo.tail % MAX_REQUESTS);
   local_elem->addr         = addr;
   local_elem->ready        = 1;
-  local_elem->size         = size;
-  local_elem->seq          = comm->rem_fifo.tail;
-  local_elem->addr_request = req_addr;
+  local_elem->seq          = req_id;
   local_elem->rkey_id      = mh->id;
-  
-  memcpy(local_elem->rkey_buf, mh->rkey_buf, mh->rkey_buf_size);
+  local_elem->rkey         = mh->rkey_bundle.rkey;  
+  // if (!mh->cached) {
+  //   mh->cached = 1;
+  //   memcpy(local_elem->rkey_buf, mh->rkey_buf, mh->rkey_buf_size);
+  // }
   remote_addr = comm->rem_fifo.addr + (comm->rem_fifo.tail % MAX_REQUESTS) *
                                       sizeof(nccl_uct_send_fifo_t);
   status = uct_ep_put_short(comm->super.ep, local_elem, sizeof(nccl_uct_send_fifo_t),
                             remote_addr, comm->rem_fifo.rkey.rkey);
-  if (status < 0) {
-      WARN("post_fifo put short failed %d", (int)status);
-      return ncclInternalError;
-  }
   comm->rem_fifo.tail++;
 
   return ncclSuccess;
@@ -677,6 +697,7 @@ ncclResult_t nccl_uct_irecv(void *recv_comm, void *data, int size,
 {
   nccl_uct_recv_comm_t *comm = (nccl_uct_recv_comm_t*)recv_comm;
   nccl_uct_request_t   *req;
+  int                  req_id;
 
   if (comm->super.ready == 0) {
     NCCLCHECK(nccl_uct_recv_check(comm));
@@ -686,12 +707,13 @@ ncclResult_t nccl_uct_irecv(void *recv_comm, void *data, int size,
     return ncclSuccess;
   }
 
-  NCCLCHECK(nccl_uct_get_request(comm->super.reqs, &req));
-  req->size = -1;
-  NCCLCHECK(nccl_uct_post_fifo(comm, mhandle, (uint64_t)data, size,
-                               (uint64_t)&req->size));
+  NCCLCHECK(nccl_uct_get_request(comm->super.reqs, &req, &req_id));
   req->worker = comm->super.worker;
-  req->type   = NCCL_UCT_REQ_TYPE_RECV;
+ 
+  NCCLCHECK(nccl_uct_post_fifo(comm, mhandle, (uint64_t)data, req_id));
+ // uct_worker_progress(req->worker);
+
+  req->type = 1;
   *request = req;
   return ncclSuccess;
 }
@@ -701,41 +723,48 @@ ncclResult_t nccl_uct_flush(void* recv_comm, void* data, int size,
   return ncclSuccess;
 }
 
+int n_sends;
+int n_recvs;
+
+double send_time_total;
+double recv_time_total;
+
 ncclResult_t nccl_uct_test(void *request, int *done, int *size)
 {
   nccl_uct_request_t *req = (nccl_uct_request_t*)request;
-
-  uct_worker_progress(req->worker);
-  switch(req->type) {
-    case NCCL_UCT_REQ_TYPE_SEND:
-      if (req->done == 1) {
-        req->used = 0;
-        *done = 1;
-        return ncclSuccess;
-      }
-      break;
-    case NCCL_UCT_REQ_TYPE_RECV:
-      if (req->size != -1) {
-        req->used = 0;
-        *done = 1;
-        if (size) {
-            *size = req->size;
-        }
-        return ncclSuccess;
-      }
-      break;    
-  };
+  int p;
   *done = 0;
-
+  do {
+    if (req->done) {
+      // if (req->type == 0) {
+      //   n_sends++;
+      //   send_time_total += ucs_time_to_usec(ucs_get_time()) - ucs_time_to_usec(req->start);
+      // }
+      // else {
+      //   n_recvs++;
+      //   recv_time_total += ucs_time_to_usec(ucs_get_time()) - ucs_time_to_usec(req->start);
+      // }
+      *done = 1;
+      if (size) {
+        *size = req->size;
+      }
+      req->used = 0;
+      return ncclSuccess;
+    }
+    p = uct_worker_progress(req->worker);
+  } while (p);
   return ncclSuccess;
 }
-
 
 ncclResult_t nccl_uct_close_send(void *send_comm)
 {
   nccl_uct_send_comm_t *comm = (nccl_uct_send_comm_t*)send_comm;
   int                  i;
   if (comm) {
+    if (n_sends>0) {
+      INFO(NCCL_NET, "send time total %lf nsends %d average %lf",
+           send_time_total, n_sends, send_time_total / n_sends);
+    }
     for(i = 0; i < NCCL_UCT_MAX_COMM_RKEYS; i++) {
       if (comm->rkey_cache[i].exist == 1) {
         uct_rkey_release(comm->super.component,
@@ -758,6 +787,11 @@ ncclResult_t nccl_uct_close_recv(void *recv_comm)
   nccl_uct_recv_comm_t *comm = (nccl_uct_recv_comm_t*)recv_comm;
 
   if (comm) {
+    if (n_recvs>0) {
+      INFO(NCCL_NET, "recv time total %lf nrecvs %d average %lf",
+           recv_time_total, n_recvs, recv_time_total / n_recvs);
+    }
+
     uct_md_mem_dereg(comm->super.md, comm->req_memh);
     uct_rkey_release(comm->super.component, &comm->rem_fifo.rkey);
     uct_ep_destroy(comm->super.ep);

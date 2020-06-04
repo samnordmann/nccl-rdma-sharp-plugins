@@ -75,7 +75,7 @@ ncclResult_t pluginInit(ncclDebugLogger_t logFunction)
     else if (!strcasecmp(p2p_layer, "uct_rma")) p2p_plugin = NCCL_P2P_UCT_RMA;
 #endif
     else {
-      WARN("Invalid value %s for NCCL_PLUGIN_P2P, using default.", p2p_layer);
+      WARN("Invalid value (%s) for NCCL_PLUGIN_P2P, using default.", p2p_layer);
     }
   }
   switch (p2p_plugin) {
