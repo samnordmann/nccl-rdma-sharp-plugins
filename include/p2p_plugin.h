@@ -35,6 +35,12 @@ typedef enum nccl_p2p_plugin {
   NCCL_P2P_LAST
 } nccl_p2p_plugin_t;
 
+typedef enum nccl_coll_plugin {
+  NCCL_COLL_SHARP,
+  NCCL_COLL_UCC,
+  NCCL_COLL_LAST
+} nccl_coll_plugin_t;
+
 struct ncclIbMr {
   uintptr_t addr;
   int pages;

@@ -512,7 +512,7 @@ ncclResult_t ncclSharpCloseListen(void* listenComm) {
   return status;
 }
 
-ncclCollNet_t NCCL_COLLNET_PLUGIN_SYMBOL = {
+ncclCollNet_t sharpPlugin = {
   "SHARP",
   ncclSharpInit,
   ncclSharpDevices,

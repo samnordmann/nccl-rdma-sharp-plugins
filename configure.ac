@@ -89,6 +89,12 @@ m4_include([m4/ucx.m4])
 CHECK_UCX
 AC_MSG_RESULT([UCX support: $ucx_happy])
 
+# check for ucc
+AM_CONDITIONAL([HAVE_UCC_PLUGIN], [false])
+m4_include([m4/ucc.m4])
+CHECK_UCC
+AC_MSG_RESULT([UCC support: $ucc_happy])
+
 # check for sharp
 AM_CONDITIONAL([HAVE_SHARP_PLUGIN], [false])
 m4_include([m4/sharp.m4])

@@ -28,20 +28,45 @@ ncclDebugLogger_t pluginLogFunction;
 
 #ifdef HAVE_SHARP_PLUGIN
 extern int ncclNSharpDevs;
+extern ncclCollNet_t sharpPlugin;
 #else
 /* In case sharp plugin is not there just define this variable locally to make code cleaner */
 int ncclNSharpDevs;
 #endif
+
+#ifdef HAVE_UCC_PLUGIN
+extern ncclCollNet_t uccPlugin;
+#endif
+
 extern int ncclIbRelaxedOrderingEnabled;
 NCCL_PARAM(SharpMaxComms, "SHARP_MAX_COMMS", 1);
 
 ncclResult_t pluginInit(ncclDebugLogger_t logFunction);
+
+ncclResult_t collPluginInit(ncclDebugLogger_t logFunction);
 
 ncclNet_t NCCL_PLUGIN_SYMBOL = {
   "NCCL RDMA Plugin",
   pluginInit,
   NULL,
   NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL,
+  NULL
+};
+
+ncclCollNet_t NCCL_COLLNET_PLUGIN_SYMBOL = {
+  "NCCL Collective Plugin",
+  collPluginInit,
   NULL,
   NULL,
   NULL,
@@ -95,6 +120,65 @@ ncclResult_t pluginInit(ncclDebugLogger_t logFunction)
   INFO(NCCL_INIT|NCCL_NET, "P2P plugin %s", NCCL_PLUGIN_SYMBOL.name);
 
   return NCCL_PLUGIN_SYMBOL.init(logFunction);
+}
+
+static nccl_coll_plugin_t coll_plugin = NCCL_COLL_LAST;
+ncclResult_t collPluginInit(ncclDebugLogger_t logFunction)
+{
+  pluginLogFunction = logFunction;
+  const char *plugin_path = get_plugin_lib_path();
+  if (plugin_path != NULL) {
+    INFO(NCCL_INIT|NCCL_NET, "Plugin Path : %s", plugin_path);;
+  }
+
+#ifdef HAVE_SHARP_PLUGIN
+/* sharp is default coll plugin */
+  coll_plugin = NCCL_COLL_SHARP;
+#else
+  coll_plugin = NCCL_COLL_LAST;
+#endif
+
+  const char *coll_layer = getenv("NCCL_PLUGIN_COLL");
+  if (coll_layer != NULL) {
+#ifdef HAVE_SHARP_PLUGIN
+    if (!strcasecmp(coll_layer, "sharp")) {
+      coll_plugin = NCCL_COLL_SHARP;
+      goto set_plugin;
+    }
+#endif
+#ifdef HAVE_UCC_PLUGIN
+    if (!strcasecmp(coll_layer, "ucc")) {
+      coll_plugin = NCCL_COLL_UCC;
+      goto set_plugin;
+    }
+#endif
+    WARN("Invalid value %s for NCCL_PLUGIN_COLL", coll_layer);
+    return ncclInternalError;
+  }
+
+  if (coll_plugin == NCCL_COLL_LAST) {
+    WARN("No collective plugins available");
+    return ncclInternalError;
+  }
+
+set_plugin:
+  switch (coll_plugin) {
+#ifdef HAVE_SHARP_PLUGIN
+    case NCCL_COLL_SHARP:
+      NCCL_COLLNET_PLUGIN_SYMBOL = sharpPlugin;;
+      break;
+#endif
+#ifdef HAVE_UCC_PLUGIN
+    case NCCL_COLL_UCC:
+      NCCL_COLLNET_PLUGIN_SYMBOL = uccPlugin;
+      break;
+#endif
+    default:
+      break;
+  }
+  INFO(NCCL_INIT|NCCL_NET, "Coll plugin %s", NCCL_COLLNET_PLUGIN_SYMBOL.name);
+
+  return NCCL_COLLNET_PLUGIN_SYMBOL.init(logFunction);
 }
 
 ncclResult_t nccl_p2p_gdr_support(int dev)
@@ -338,4 +422,3 @@ nccl_p2p_plugin_t nccl_p2p_get_plugin_type()
 
 struct ncclIbDev ncclIbDevs[MAX_IB_DEVS];
 struct ncclIbDev userIbDevs[MAX_IB_DEVS];
-

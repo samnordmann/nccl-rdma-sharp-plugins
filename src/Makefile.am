@@ -21,7 +21,7 @@ libnccl_net_la_SOURCES = \
 if HAVE_UCX_PLUGIN
 libnccl_net_la_CPPFLAGS += -DHAVE_UCX_PLUGIN $(UCX_CPPFLAGS)
 libnccl_net_la_LIBADD   += $(UCX_LIBADD)
-libnccl_net_la_LDFLAGS  += $(UCX_LDFLAGS) 
+libnccl_net_la_LDFLAGS  += $(UCX_LDFLAGS)
 libnccl_net_la_SOURCES  += \
 	ucx_plugin.c \
 	ucx_rma_plugin.c
@@ -30,6 +30,13 @@ endif
 if HAVE_SHARP_PLUGIN
 libnccl_net_la_CPPFLAGS += -DHAVE_SHARP_PLUGIN $(SHARP_CPPFLAGS)
 libnccl_net_la_LIBADD   += $(SHARP_LIBADD)
-libnccl_net_la_LDFLAGS  += $(SHARP_LDFLAGS) 
+libnccl_net_la_LDFLAGS  += $(SHARP_LDFLAGS)
 libnccl_net_la_SOURCES  += sharp_plugin.c
+endif
+
+if HAVE_UCC_PLUGIN
+libnccl_net_la_CPPFLAGS += -DHAVE_UCC_PLUGIN $(UCC_CPPFLAGS)
+libnccl_net_la_LIBADD   += $(UCC_LIBADD)
+libnccl_net_la_LDFLAGS  += $(UCC_LDFLAGS)
+libnccl_net_la_SOURCES  += ucc_plugin.c
 endif
