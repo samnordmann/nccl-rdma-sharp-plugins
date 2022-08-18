@@ -132,4 +132,6 @@ int ncclIbRelaxedOrderingCapable(void);
 
 nccl_p2p_plugin_t nccl_p2p_get_plugin_type();
 
+extern int ncclNSharpDevs;
+
 #endif
