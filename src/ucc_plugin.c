@@ -352,12 +352,14 @@ ncclResult_t ncclUCCIallreduce(void *collComm, void *sendData, void *recvData,
       .src.info.mem_type =
           (mr_src->type == NCCL_PTR_CUDA ? UCC_MEMORY_TYPE_CUDA
                                          : UCC_MEMORY_TYPE_HOST),
+      .dst.info.buffer = recvData,
+      .dst.info.mem_type =
+          (mr_dst->type == NCCL_PTR_CUDA ? UCC_MEMORY_TYPE_CUDA
+                                         : UCC_MEMORY_TYPE_HOST),
       .op = opConvert(redOp),
   };
-  args.dst.info.buffer = args.src.info.buffer;
   args.dst.info.count = args.src.info.count;
   args.dst.info.datatype = args.src.info.datatype;
-  args.dst.info.mem_type = args.src.info.mem_type;
   ucc_coll_req_h ucc_req;
   ncclUCC_CHECK(ucc_collective_init(&args, &ucc_req, cComm->team),
                 "Error during allreduce initialization");
